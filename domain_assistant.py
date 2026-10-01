@@ -242,28 +242,182 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
-class OpenAIGenerator:
-    def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
-        if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+
+PROVIDER_CONFIGS = {
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "model_env": "GROQ_MODEL",
+        "default_model": "llama-3.3-70b-versatile",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "model_env": "OPENROUTER_MODEL",
+        "default_model": "meta-llama/llama-3.3-70b-instruct",
+        "default_headers": {
+            "HTTP-Referer": "https://github.com/aicb-p1/evaluation",
+            "X-Title": "AI-Evaluation-Lab",
+        },
+    },
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "api_key_env": "GEMINI_API_KEY",
+        "model_env": "GEMINI_MODEL",
+        "default_model": "gemini-2.0-flash",
+    },
+    "openai": {
+        "base_url": None,
+        "api_key_env": "OPENAI_API_KEY",
+        "model_env": "OPENAI_MODEL",
+        "default_model": "gpt-4o-mini",
+    },
+}
+
+
+class LLMGenerator:
+    """Universal LLM generator supporting OpenAI, Groq, OpenRouter, Gemini, etc."""
+
+    def __init__(
+        self,
+        provider: str | None = None,
+        model: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        max_output_tokens: int = 300,
+    ) -> None:
         self.max_output_tokens = max_output_tokens
 
+        # Auto-detect or retrieve configured provider
+        if not provider:
+            provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+
+        if not provider or provider == "auto":
+            if os.getenv("GROQ_API_KEY", "").strip():
+                provider = "groq"
+            elif os.getenv("OPENROUTER_API_KEY", "").strip():
+                provider = "openrouter"
+            elif os.getenv("GEMINI_API_KEY", "").strip():
+                provider = "gemini"
+            elif os.getenv("OPENAI_API_KEY", "").strip():
+                provider = "openai"
+            elif os.getenv("LLM_API_KEY", "").strip():
+                provider = "custom"
+            else:
+                provider = "openai"
+
+        self.provider = provider.lower()
+        config = PROVIDER_CONFIGS.get(self.provider, {})
+
+        # Resolve API key
+        if not api_key:
+            key_var = config.get("api_key_env", "LLM_API_KEY")
+            api_key = os.getenv(key_var, "").strip() or os.getenv("LLM_API_KEY", "").strip()
+
+        # Resolve model name
+        if not model:
+            model_var = config.get("model_env", "LLM_MODEL")
+            model = (
+                os.getenv(model_var, "").strip()
+                or os.getenv("LLM_MODEL", "").strip()
+                or config.get("default_model", "")
+            )
+
+        # Resolve base URL
+        if base_url is None:
+            base_url = os.getenv("LLM_BASE_URL", "").strip() or config.get("base_url")
+
+        if not api_key:
+            expected_key = config.get("api_key_env", "LLM_API_KEY")
+            raise RuntimeError(
+                f"Missing API key for provider '{self.provider}'. "
+                f"Please define {expected_key} in your .env file."
+            )
+        if not model:
+            expected_model = config.get("model_env", "LLM_MODEL")
+            raise RuntimeError(
+                f"Missing model name for provider '{self.provider}'. "
+                f"Please define {expected_model} in your .env file."
+            )
+
+        self.model = model
+        self.base_url = base_url
+
+        client_kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        if config.get("default_headers"):
+            client_kwargs["default_headers"] = config["default_headers"]
+
+        self.client = OpenAI(**client_kwargs)
+
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
+        # Standard chat completions (compatible with Groq, OpenRouter, Gemini, and OpenAI)
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=self.max_output_tokens,
+            )
+            answer = ""
+            if response.choices and response.choices[0].message:
+                answer = (response.choices[0].message.content or "").strip()
+            if answer:
+                return answer
+        except Exception as chat_exc:
+            # Fallback for OpenAI responses API if specifically available
+            if self.provider == "openai" and not self.base_url and hasattr(self.client, "responses"):
+                try:
+                    resp = self.client.responses.create(
+                        model=self.model,
+                        input=prompt,
+                        temperature=0,
+                        max_output_tokens=self.max_output_tokens,
+                    )
+                    answer = resp.output_text.strip()
+                    if answer:
+                        return answer
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"{self.provider.upper()} API call failed for model '{self.model}': {chat_exc}"
+            ) from chat_exc
+
+        raise RuntimeError(f"{self.provider.upper()} returned an empty answer")
+
+
+class OpenAIGenerator(LLMGenerator):
+    """Backwards-compatible OpenAI generator. Auto-detects provider if configured."""
+
+    def __init__(
+        self,
+        model: str | None = None,
+        api_key: str | None = None,
+        max_output_tokens: int = 300,
+    ) -> None:
+        super().__init__(
+            provider=os.getenv("LLM_PROVIDER") or "openai",
+            model=model,
+            api_key=api_key,
+            max_output_tokens=max_output_tokens,
         )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+
+
+class GroqGenerator(LLMGenerator):
+    def __init__(self, model: str | None = None, max_output_tokens: int = 300) -> None:
+        super().__init__(provider="groq", model=model, max_output_tokens=max_output_tokens)
+
+
+class OpenRouterGenerator(LLMGenerator):
+    def __init__(self, model: str | None = None, max_output_tokens: int = 300) -> None:
+        super().__init__(provider="openrouter", model=model, max_output_tokens=max_output_tokens)
+
+
+class GeminiGenerator(LLMGenerator):
+    def __init__(self, model: str | None = None, max_output_tokens: int = 300) -> None:
+        super().__init__(provider="gemini", model=model, max_output_tokens=max_output_tokens)
+
 
 
 @dataclass(frozen=True)
@@ -489,15 +643,32 @@ def parse_args() -> argparse.Namespace:
         help="Output artifact (default: artifacts/actual_answers.json)",
     )
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--provider",
+        type=str,
+        default=None,
+        choices=["openai", "groq", "openrouter", "gemini", "auto"],
+        help="LLM provider: groq, openrouter, gemini, openai, auto (default: auto-detected from .env)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model name to override .env configuration",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    generator = None
+    if args.provider or args.model:
+        generator = LLMGenerator(provider=args.provider, model=args.model)
     try:
         artifact = generate_actual_answers(
             args.dataset,
             args.corpus_dir,
+            generator=generator,
             top_k=args.top_k,
             progress=lambda message: print(message, flush=True),
         )
